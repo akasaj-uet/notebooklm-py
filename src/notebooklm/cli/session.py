@@ -43,6 +43,10 @@ from .language import set_language
 
 logger = logging.getLogger(__name__)
 
+GOOGLE_ACCOUNTS_URL = "https://accounts.google.com/"
+NOTEBOOKLM_URL = "https://notebooklm.google.com/"
+NOTEBOOKLM_HOST = "notebooklm.google.com"
+
 
 def _sync_server_language_to_config() -> None:
     """Fetch server language setting and persist to local config.
@@ -154,13 +158,21 @@ def register_session_commands(cli):
         "--storage",
         type=click.Path(),
         default=None,
-        help="Where to save storage_state.json (default: $NOTEBOOKLM_HOME/storage_state.json)",
+        help="Where to save storage_state.json (default: profile-specific location)",
     )
-    def login(storage):
+    @click.option(
+        "--browser",
+        type=click.Choice(["chromium", "msedge"], case_sensitive=False),
+        default="chromium",
+        help="Browser to use for login (default: chromium). Use 'msedge' for Microsoft Edge.",
+    )
+    def login(storage, browser):
         """Log in to NotebookLM via browser.
 
         Opens a browser window for Google login. After logging in,
         press ENTER in the terminal to save authentication.
+
+        Use --browser msedge if your organization requires Microsoft Edge for SSO.
 
         Note: Cannot be used when NOTEBOOKLM_AUTH_JSON is set (use file-based
         auth or unset the env var first).
@@ -177,42 +189,77 @@ def register_session_commands(cli):
             )
             raise SystemExit(1)
 
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            console.print(
-                "[red]Playwright not installed. Run:[/red]\n"
-                "  pip install notebooklm[browser]\n"
-                "  playwright install chromium"
-            )
-            raise SystemExit(1) from None
-
-        # Pre-flight check: verify Chromium browser is installed
-        _ensure_chromium_installed()
-
         storage_path = Path(storage) if storage else get_storage_path()
         browser_profile = get_browser_profile_dir()
-        storage_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        browser_profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if sys.platform == "win32":
+            # On Windows < Python 3.13, mode= is ignored by mkdir(). On
+            # Python 3.13+, mode= applies Windows ACLs that can be overly
+            # restrictive (0o700 blocks other same-user processes). Skip mode
+            # and chmod entirely; Windows inherits ACLs from the parent.
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            browser_profile.mkdir(parents=True, exist_ok=True)
+        else:
+            storage_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            storage_path.parent.chmod(0o700)
+            browser_profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+            browser_profile.chmod(0o700)
 
-        console.print("[yellow]Opening browser for Google login...[/yellow]")
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            if browser == "msedge":
+                install_hint = "  pip install notebooklm[browser]"
+            else:
+                install_hint = "  pip install notebooklm[browser]\n  playwright install chromium"
+            console.print(f"[red]Playwright not installed. Run:[/red]\n{install_hint}")
+            raise SystemExit(1) from None
+
+        # Pre-flight check: verify Chromium browser is installed (skip for Edge)
+        if browser == "chromium":
+            _ensure_chromium_installed()
+
+        from ..paths import resolve_profile
+
+        profile_name = resolve_profile()
+        browser_label = "Microsoft Edge" if browser == "msedge" else "Chromium"
+        console.print(f"[dim]Profile: {profile_name}[/dim]")
+        console.print(f"[yellow]Opening {browser_label} for Google login...[/yellow]")
         console.print(f"[dim]Using persistent profile: {browser_profile}[/dim]")
 
         # Use context manager to restore ProactorEventLoop for Playwright on Windows
         # (fixes #89: NotImplementedError on Windows Python 3.12)
         with _windows_playwright_event_loop(), sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(browser_profile),
-                headless=False,
-                args=[
+            launch_kwargs: dict[str, Any] = {
+                "user_data_dir": str(browser_profile),
+                "headless": False,
+                "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--password-store=basic",  # Avoid macOS keychain encryption for headless compatibility
                 ],
-                ignore_default_args=["--enable-automation"],
-            )
+                "ignore_default_args": ["--enable-automation"],
+            }
+            if browser == "msedge":
+                launch_kwargs["channel"] = "msedge"
+
+            try:
+                context = p.chromium.launch_persistent_context(**launch_kwargs)
+            except Exception as e:
+                if browser == "msedge" and (
+                    "executable doesn't exist" in str(e).lower()
+                    or "no such file" in str(e).lower()
+                    or "failed to launch" in str(e).lower()
+                ):
+                    console.print(
+                        "[red]Microsoft Edge not found.[/red]\n"
+                        "Install from: https://www.microsoft.com/edge\n"
+                        "Or use the default Chromium browser: notebooklm login"
+                    )
+                    raise SystemExit(1) from None
+                raise
 
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto("https://notebooklm.google.com/")
+            page.goto(NOTEBOOKLM_URL)
 
             console.print("\n[bold green]Instructions:[/bold green]")
             console.print("1. Complete the Google login in the browser window")
@@ -221,8 +268,19 @@ def register_session_commands(cli):
 
             input("[Press ENTER when logged in] ")
 
+            # Force .google.com cookies for regional users (e.g. UK lands on
+            # .google.co.uk). Use "commit" to resolve once response headers
+            # (including Set-Cookie) are processed, before any client-side
+            # JS redirect can interrupt. See #214.
+            for url in [GOOGLE_ACCOUNTS_URL, NOTEBOOKLM_URL]:
+                try:
+                    page.goto(url, wait_until="commit")
+                except PlaywrightError as exc:
+                    if "Navigation interrupted" not in str(exc):
+                        raise
+
             current_url = page.url
-            if "notebooklm.google.com" not in current_url:
+            if NOTEBOOKLM_HOST not in current_url:
                 console.print(f"[yellow]Warning: Current URL is {current_url}[/yellow]")
                 if not click.confirm("Save authentication anyway?"):
                     context.close()
@@ -230,7 +288,9 @@ def register_session_commands(cli):
 
             context.storage_state(path=str(storage_path))
             # Restrict permissions to owner only (contains sensitive cookies)
-            storage_path.chmod(0o600)
+            if sys.platform != "win32":
+                # chmod is a no-op on Windows (and can confuse ACLs)
+                storage_path.chmod(0o600)
             context.close()
 
         console.print(f"\n[green]Authentication saved to:[/green] {storage_path}")
@@ -330,7 +390,13 @@ def register_session_commands(cli):
             table.add_column("Path", style="cyan")
             table.add_column("Source", style="green")
 
+            table.add_row(
+                "Profile",
+                path_info.get("profile", "default"),
+                path_info.get("profile_source", ""),
+            )
             table.add_row("Home Directory", path_info["home_dir"], path_info["home_source"])
+            table.add_row("Profile Directory", path_info.get("profile_dir", ""), "")
             table.add_row("Storage State", path_info["storage_path"], "")
             table.add_row("Context", path_info["context_path"], "")
             table.add_row("Browser Profile", path_info["browser_profile_dir"], "")

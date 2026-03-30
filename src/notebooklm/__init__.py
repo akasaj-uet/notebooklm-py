@@ -41,7 +41,7 @@ except PackageNotFoundError:
     )
 
 # Public API: Authentication
-from .auth import DEFAULT_STORAGE_PATH, AuthTokens
+from .auth import AuthTokens
 
 # Public API: Client
 from .client import NotebookLMClient
@@ -100,9 +100,11 @@ from .types import (
     GenerationStatus,
     InfographicDetail,
     InfographicOrientation,
+    InfographicStyle,
     Note,
     Notebook,
     NotebookDescription,
+    NotebookMetadata,
     QuizDifficulty,
     QuizQuantity,
     ReportFormat,
@@ -117,6 +119,7 @@ from .types import (
     Source,
     SourceFulltext,
     SourceStatus,
+    SourceSummary,
     SourceType,
     # Enums for configuration
     SuggestedTopic,
@@ -132,13 +135,14 @@ __all__ = [
     "NotebookLMClient",
     # Auth
     "AuthTokens",
-    "DEFAULT_STORAGE_PATH",
     # Types
     "Notebook",
     "NotebookDescription",
+    "NotebookMetadata",
     "SuggestedTopic",
     "Source",
     "SourceFulltext",
+    "SourceSummary",
     "Artifact",
     "GenerationStatus",
     "ReportSuggestion",
@@ -194,6 +198,7 @@ __all__ = [
     "QuizDifficulty",
     "InfographicOrientation",
     "InfographicDetail",
+    "InfographicStyle",
     "SlideDeckFormat",
     "SlideDeckLength",
     "ReportFormat",
@@ -217,6 +222,19 @@ def __getattr__(name: str):
     Uses globals() caching to avoid duplicate warnings on repeated access.
     """
     import warnings
+
+    if name == "DEFAULT_STORAGE_PATH":
+        from .paths import get_storage_path
+
+        warnings.warn(
+            "DEFAULT_STORAGE_PATH is deprecated, use notebooklm.paths.get_storage_path() instead. "
+            "Will be removed in v0.5.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        val = get_storage_path()
+        globals()[name] = val
+        return val
 
     if name == "StudioContentType":
         from .rpc.types import ArtifactTypeCode

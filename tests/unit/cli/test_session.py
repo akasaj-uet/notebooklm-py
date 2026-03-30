@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
@@ -82,6 +83,189 @@ class TestLoginCommand:
 
         assert result.exit_code == 1
         assert "Cannot run 'login' when NOTEBOOKLM_AUTH_JSON is set" in result.output
+
+    def test_login_help_shows_browser_option(self, runner):
+        """Test login --help shows --browser option with chromium/msedge choices."""
+        result = runner.invoke(cli, ["login", "--help"])
+
+        assert result.exit_code == 0
+        assert "--browser" in result.output
+        assert "chromium" in result.output
+        assert "msedge" in result.output
+
+    def test_login_rejects_invalid_browser(self, runner):
+        """Test login rejects invalid --browser values."""
+        result = runner.invoke(cli, ["login", "--browser", "firefox"])
+
+        assert result.exit_code != 0
+
+    @pytest.fixture
+    def mock_login_browser(self, tmp_path):
+        """Mock Playwright browser launch for login --browser tests.
+
+        Yields (mock_ensure, mock_launch) for assertions on chromium install
+        check and launch_persistent_context kwargs.
+        """
+        with (
+            patch("notebooklm.cli.session._ensure_chromium_installed") as mock_ensure,
+            patch("playwright.sync_api.sync_playwright") as mock_pw,
+            patch(
+                "notebooklm.cli.session.get_storage_path", return_value=tmp_path / "storage.json"
+            ),
+            patch(
+                "notebooklm.cli.session.get_browser_profile_dir",
+                return_value=tmp_path / "profile",
+            ),
+            patch("notebooklm.cli.session._sync_server_language_to_config"),
+            patch("builtins.input", return_value=""),
+        ):
+            mock_context = MagicMock()
+            mock_page = MagicMock()
+            mock_page.url = "https://notebooklm.google.com/"
+            mock_context.pages = [mock_page]
+            mock_launch = (
+                mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
+            )
+            mock_launch.return_value = mock_context
+
+            yield mock_ensure, mock_launch
+
+    def test_login_msedge_skips_chromium_install(self, runner, mock_login_browser):
+        """Test --browser msedge skips _ensure_chromium_installed."""
+        mock_ensure, _ = mock_login_browser
+        runner.invoke(cli, ["login", "--browser", "msedge"])
+        mock_ensure.assert_not_called()
+
+    def test_login_msedge_passes_channel_param(self, runner, mock_login_browser):
+        """Test --browser msedge passes channel='msedge' to launch_persistent_context."""
+        _, mock_launch = mock_login_browser
+        runner.invoke(cli, ["login", "--browser", "msedge"])
+        assert mock_launch.call_args[1].get("channel") == "msedge"
+
+    def test_login_chromium_default_no_channel(self, runner, mock_login_browser):
+        """Test default chromium calls _ensure_chromium_installed and has no channel."""
+        mock_ensure, mock_launch = mock_login_browser
+        runner.invoke(cli, ["login", "--browser", "chromium"])
+        mock_ensure.assert_called_once()
+        assert "channel" not in mock_launch.call_args[1]
+
+    def test_login_msedge_not_installed_shows_helpful_error(self, runner, tmp_path):
+        """Test --browser msedge shows helpful error when Edge is not installed."""
+        with (
+            patch("notebooklm.cli.session._ensure_chromium_installed"),
+            patch("playwright.sync_api.sync_playwright") as mock_pw,
+            patch(
+                "notebooklm.cli.session.get_storage_path", return_value=tmp_path / "storage.json"
+            ),
+            patch(
+                "notebooklm.cli.session.get_browser_profile_dir",
+                return_value=tmp_path / "profile",
+            ),
+        ):
+            mock_launch = (
+                mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
+            )
+            mock_launch.side_effect = Exception(
+                "Executable doesn't exist at /ms-edge\nFailed to launch"
+            )
+
+            result = runner.invoke(cli, ["login", "--browser", "msedge"])
+
+        assert result.exit_code == 1
+        assert "Microsoft Edge not found" in result.output
+        assert "microsoft.com/edge" in result.output
+
+    @pytest.fixture
+    def mock_login_browser_with_storage(self, tmp_path):
+        """Mock Playwright browser for login tests that assert exit_code == 0.
+
+        Like mock_login_browser but also makes storage_state() create the file
+        so that storage_path.chmod() succeeds.
+        """
+        storage_file = tmp_path / "storage.json"
+        with (
+            patch("notebooklm.cli.session._ensure_chromium_installed"),
+            patch("playwright.sync_api.sync_playwright") as mock_pw,
+            patch("notebooklm.cli.session.get_storage_path", return_value=storage_file),
+            patch(
+                "notebooklm.cli.session.get_browser_profile_dir",
+                return_value=tmp_path / "profile",
+            ),
+            patch("notebooklm.cli.session._sync_server_language_to_config"),
+            patch("builtins.input", return_value=""),
+        ):
+            mock_context = MagicMock()
+            mock_page = MagicMock()
+            mock_page.url = "https://notebooklm.google.com/"
+            mock_context.pages = [mock_page]
+            # Make storage_state create the file so chmod succeeds
+            mock_context.storage_state.side_effect = lambda path: Path(path).write_text("{}")
+            mock_launch = (
+                mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
+            )
+            mock_launch.return_value = mock_context
+
+            yield mock_page
+
+    def test_login_handles_navigation_interrupted_error(
+        self, runner, mock_login_browser_with_storage
+    ):
+        """Test login succeeds when page.goto raises 'Navigation interrupted' (#214)."""
+        mock_page = mock_login_browser_with_storage
+        from playwright.sync_api import Error as PlaywrightError
+
+        call_count = 0
+        original_url = mock_page.url
+
+        def goto_side_effect(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # First goto (NOTEBOOKLM_URL before login) succeeds
+            # Second and third (cookie-forcing) raise navigation interrupted
+            if call_count >= 2:
+                raise PlaywrightError("Page.goto: Navigation interrupted by another one")
+
+        mock_page.goto.side_effect = goto_side_effect
+        mock_page.url = original_url
+
+        result = runner.invoke(cli, ["login"])
+
+        assert result.exit_code == 0
+        assert "Authentication saved" in result.output
+
+    def test_login_reraises_non_navigation_playwright_errors(
+        self, runner, mock_login_browser_with_storage
+    ):
+        """Test login re-raises PlaywrightError that isn't 'Navigation interrupted'."""
+        mock_page = mock_login_browser_with_storage
+        from playwright.sync_api import Error as PlaywrightError
+
+        call_count = 0
+
+        def goto_side_effect(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise PlaywrightError("Page.goto: net::ERR_CONNECTION_REFUSED")
+
+        mock_page.goto.side_effect = goto_side_effect
+
+        result = runner.invoke(cli, ["login"])
+
+        assert result.exit_code != 0
+
+    def test_login_uses_commit_wait_strategy(self, runner, mock_login_browser_with_storage):
+        """Test login uses wait_until='commit' for cookie-forcing navigation."""
+        mock_page = mock_login_browser_with_storage
+
+        result = runner.invoke(cli, ["login"])
+
+        assert result.exit_code == 0
+        goto_calls = mock_page.goto.call_args_list
+        # 3 calls: initial NOTEBOOKLM_URL, then accounts.google.com, then NOTEBOOKLM_URL
+        assert len(goto_calls) == 3
+        assert goto_calls[1].kwargs.get("wait_until") == "commit"
+        assert goto_calls[2].kwargs.get("wait_until") == "commit"
 
 
 # =============================================================================
@@ -793,3 +977,117 @@ class TestSessionEdgeCases:
         # Title and is_owner should be None due to JSONDecodeError
         assert output_data["notebook"]["title"] is None
         assert output_data["notebook"]["is_owner"] is None
+
+
+# =============================================================================
+# WINDOWS PERMISSION REGRESSION TESTS (fixes #212)
+# =============================================================================
+
+
+class TestLoginWindowsPermissions:
+    """Regression tests for Windows permission handling in login command.
+
+    On Windows, mkdir(mode=0o700) and chmod() can cause PermissionError
+    because Python 3.13+ applies restrictive ACLs. The login command must
+    skip both on Windows while preserving Unix hardening.
+
+    See: https://github.com/teng-lin/notebooklm-py/issues/212
+    """
+
+    @pytest.fixture
+    def _patch_login_deps(self, tmp_path, monkeypatch):
+        """Patch all login dependencies to isolate mkdir/chmod behavior."""
+        storage_path = tmp_path / "home" / "storage_state.json"
+        browser_profile = tmp_path / "profile"
+
+        monkeypatch.setattr("notebooklm.cli.session.get_storage_path", lambda: storage_path)
+        monkeypatch.setattr(
+            "notebooklm.cli.session.get_browser_profile_dir", lambda: browser_profile
+        )
+        self.storage_parent = storage_path.parent
+        self.browser_profile = browser_profile
+
+    def test_windows_login_skips_mode_and_chmod(self, monkeypatch, _patch_login_deps, runner):
+        """On Windows, login mkdir calls omit mode= and chmod is never called."""
+        import notebooklm.cli.session as session_mod
+
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+
+        mkdir_calls = []
+        chmod_calls = []
+        _orig_mkdir = Path.mkdir
+
+        def _track_mkdir(self, *args, **kwargs):
+            mkdir_calls.append({"path": self, "kwargs": kwargs})
+            return _orig_mkdir(self, *args, **kwargs)
+
+        def _track_chmod(self, *args, **kwargs):
+            chmod_calls.append({"path": self, "args": args})
+
+        monkeypatch.setattr(Path, "mkdir", _track_mkdir)
+        monkeypatch.setattr(Path, "chmod", _track_chmod)
+
+        # Trigger the login command but abort early at playwright import
+        with patch.dict("sys.modules", {"playwright": None, "playwright.sync_api": None}):
+            runner.invoke(cli, ["login"])
+
+        # mkdir should NOT receive mode= on Windows
+        for call in mkdir_calls:
+            assert (
+                "mode" not in call["kwargs"]
+            ), f"mkdir received mode= on Windows for {call['path']}"
+
+        # chmod should NOT be called on Windows
+        assert (
+            len(chmod_calls) == 0
+        ), f"chmod called {len(chmod_calls)} time(s) on Windows: {chmod_calls}"
+
+    def test_unix_login_sets_mode_and_chmod(self, monkeypatch, _patch_login_deps, runner):
+        """On Unix, login mkdir calls include mode=0o700 and chmod is called."""
+        import notebooklm.cli.session as session_mod
+
+        monkeypatch.setattr(session_mod.sys, "platform", "linux")
+
+        mkdir_calls = []
+        chmod_calls = []
+        _orig_mkdir = Path.mkdir
+
+        def _track_mkdir(self, *args, **kwargs):
+            mkdir_calls.append({"path": self, "kwargs": kwargs})
+            return _orig_mkdir(self, *args, **kwargs)
+
+        def _track_chmod(self, *args, **kwargs):
+            chmod_calls.append({"path": self, "args": args})
+
+        monkeypatch.setattr(Path, "mkdir", _track_mkdir)
+        monkeypatch.setattr(Path, "chmod", _track_chmod)
+
+        # Trigger the login command but abort early at playwright import
+        with patch.dict("sys.modules", {"playwright": None, "playwright.sync_api": None}):
+            runner.invoke(cli, ["login"])
+
+        # mkdir should receive mode=0o700 on Unix (2 calls: storage_parent + browser_profile)
+        mode_calls = [c for c in mkdir_calls if c["kwargs"].get("mode") == 0o700]
+        assert (
+            len(mode_calls) >= 2
+        ), f"Expected ≥2 mkdir calls with mode=0o700 on Unix, got {len(mode_calls)}"
+
+        # chmod(0o700) should be called on Unix (2 calls: storage_parent + browser_profile)
+        chmod_700 = [c for c in chmod_calls if c["args"] == (0o700,)]
+        assert len(chmod_700) >= 2, f"Expected ≥2 chmod(0o700) calls on Unix, got {len(chmod_700)}"
+
+    def test_windows_storage_chmod_skipped(self, monkeypatch, _patch_login_deps):
+        """On Windows, storage_state.json chmod(0o600) is also skipped."""
+        import notebooklm.cli.session as session_mod
+
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+
+        # The code at line 280-282 checks sys.platform before chmod(0o600)
+        # Verify the guard exists by checking the source
+        import inspect
+
+        source = inspect.getsource(session_mod)
+        # The pattern: if sys.platform != "win32": ... storage_path.chmod(0o600)
+        assert (
+            'sys.platform != "win32"' in source or "sys.platform != 'win32'" in source
+        ), "Missing Windows guard for storage_state.json chmod(0o600)"
